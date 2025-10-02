@@ -9,11 +9,12 @@ import { BrowserLauncherOptions, OptimizeBandwidthOptions } from "../types/index
 import { IProxyServer, ProxyServer } from "../utils/proxy.js";
 import { getBaseUrl, getUrl } from "../utils/url.js";
 import { CDPService } from "./cdp/cdp.service.js";
-import { CookieData } from "./context/types.js";
+import { CookieData, SessionData } from "./context/types.js";
 import { FileService } from "./file.service.js";
 import { SeleniumService } from "./selenium.service.js";
 import { TimezoneFetcher } from "./timezone-fetcher.service.js";
 import { deepMerge } from "../utils/context.js";
+import { SessionPersistenceService } from "./session-persistence.service.js";
 
 type Session = SessionDetails & {
   completion: Promise<void>;
@@ -51,6 +52,7 @@ export class SessionService {
   private seleniumService: SeleniumService;
   private fileService: FileService;
   private timezoneFetcher: TimezoneFetcher;
+  private persistenceService: SessionPersistenceService;
   public proxyFactory: ProxyFactory = (proxyUrl) => new ProxyServer(proxyUrl);
 
   public pastSessions: Session[] = [];
@@ -61,11 +63,13 @@ export class SessionService {
     seleniumService: SeleniumService;
     fileService: FileService;
     logger: FastifyBaseLogger;
+    persistenceService: SessionPersistenceService;
   }) {
     this.cdpService = config.cdpService;
     this.seleniumService = config.seleniumService;
     this.fileService = config.fileService;
     this.logger = config.logger;
+    this.persistenceService = config.persistenceService;
     this.timezoneFetcher = new TimezoneFetcher(config.logger);
     this.activeSession = {
       id: uuidv4(),
@@ -81,6 +85,7 @@ export class SessionService {
 
   public async startSession(options: {
     sessionId?: string;
+    userId?: string;
     proxyUrl?: string;
     userAgent?: string;
     sessionContext?: {
@@ -101,6 +106,7 @@ export class SessionService {
   }): Promise<SessionDetails> {
     const {
       sessionId,
+      userId,
       proxyUrl,
       userAgent,
       sessionContext,
@@ -115,6 +121,38 @@ export class SessionService {
       skipFingerprintInjection,
       userPreferences,
     } = options;
+
+    // Load persisted session data if userId is provided
+    let persistedData = null;
+    let mergedSessionContext = sessionContext;
+    let persistedUserAgent = userAgent;
+
+    if (userId) {
+      this.logger.info({ userId }, "Loading persisted session data for user");
+      persistedData = await this.persistenceService.getSession(userId);
+
+      if (persistedData) {
+        this.logger.info({ userId }, "Found persisted session data, restoring session");
+
+        // Merge persisted session data with provided sessionContext
+        if (persistedData.sessionData) {
+          mergedSessionContext = {
+            cookies: persistedData.sessionData.cookies || sessionContext?.cookies,
+            localStorage: {
+              ...(persistedData.sessionData.localStorage || {}),
+              ...(sessionContext?.localStorage || {}),
+            },
+          };
+        }
+
+        // Use persisted user agent if not explicitly provided
+        if (!userAgent && persistedData.userAgent) {
+          persistedUserAgent = persistedData.userAgent;
+        }
+      } else {
+        this.logger.info({ userId }, "No persisted session data found, creating new session");
+      }
+    }
 
     // start fetching timezone as early as possible
     let timezonePromise: Promise<string>;
@@ -179,8 +217,8 @@ export class SessionService {
         headless: env.CHROME_HEADLESS,
         proxyUrl: this.activeSession.proxyServer?.url,
       },
-      sessionContext,
-      userAgent,
+      sessionContext: mergedSessionContext,
+      userAgent: persistedUserAgent,
       blockAds,
       optimizeBandwidth: normalizedOptimize,
       extensions: extensions || [],
@@ -193,6 +231,11 @@ export class SessionService {
       credentials,
       skipFingerprintInjection,
     };
+
+    // Store userId in activeSession for later persistence
+    if (userId) {
+      (this.activeSession as any).userId = userId;
+    }
 
     if (isSelenium) {
       await this.cdpService.shutdown();
@@ -234,6 +277,30 @@ export class SessionService {
     if (this.activeSession.proxyServer) {
       this.activeSession.proxyTxBytes = this.activeSession.proxyServer.txBytes;
       this.activeSession.proxyRxBytes = this.activeSession.proxyServer.rxBytes;
+    }
+
+    // Save session data to Redis if userId is present
+    const userId = (this.activeSession as any).userId;
+    if (userId) {
+      try {
+        this.logger.info({ userId }, "Persisting session data for user");
+
+        // Get current browser state
+        const sessionData: SessionData = await this.cdpService.getBrowserState();
+
+        // Save to Redis
+        await this.persistenceService.saveSession(
+          userId,
+          sessionData,
+          undefined, // fingerprint is managed by fingerprint-injector
+          this.activeSession.userAgent,
+        );
+
+        this.logger.info({ userId }, "Session data persisted successfully");
+      } catch (error) {
+        this.logger.error({ err: error, userId }, "Failed to persist session data");
+        // Continue with session cleanup even if persistence fails
+      }
     }
 
     if (this.activeSession.isSelenium) {
