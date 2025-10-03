@@ -772,7 +772,7 @@ export class CDPService extends EventEmitter {
               const userIdForSeed = this.launchConfig.credentials?.userId;
 
               // Create hash from userId to determine fingerprint parameters
-              let browserMinVersion = 136;
+              let browserMinVersion = 130;
               let browserMaxVersion = undefined;
 
               if (userIdForSeed) {
@@ -782,8 +782,8 @@ export class CDPService extends EventEmitter {
                 const hash1 = uuidParts[0]?.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) || 0;
                 const hash2 = uuidParts[1]?.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) || 0;
 
-                // Use first hash for browser version (136-139)
-                browserMinVersion = 136 + (hash1 % 4);
+                // Use first hash for browser version (130-145 = 16 versions for better uniqueness)
+                browserMinVersion = 130 + (hash1 % 16);
 
                 // Use second hash to occasionally set a more specific version range
                 if (hash2 % 3 === 0) {
